@@ -6,6 +6,9 @@
 #   voterisk   — DAPO + reviewed VoteRisk-16 advantage shaping
 #
 # All non-shaping hyperparameters are identical across the two modes.
+# Hardware-only defaults below are tuned for 2 × A100 80GB. They increase
+# rollout concurrency and keep FSDP states on GPU to trade spare memory for
+# throughput without changing the optimization objective or sampling recipe.
 
 set -euo pipefail
 
@@ -41,6 +44,14 @@ while [[ ! -f "${VR_ROOT}/pyproject.toml" ]]; do
   VR_ROOT="$(cd "${VR_ROOT}/.." && pwd)"
 done
 cd "${VR_ROOT}"
+
+# A100-SXM4 is compute capability 8.0. Restricting extension compilation to
+# sm80 avoids compiling kernels for irrelevant architectures on this server.
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
+# High-memory colocated RL workloads can fragment the CUDA allocator. This
+# setting makes large, changing token batches less likely to fail from
+# fragmentation while still allowing the allocator to reuse segments.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # These defaults match the user's server layout shown for workspace_135.
 TRAIN_FILE="${TRAIN_FILE:-/home/luorongchuan/workspace_135/datasets/dapo-math-17k.formatted.train.parquet}"
@@ -80,9 +91,16 @@ ENABLE_DYNAMIC_MAX_TOKENS=True
 PENALTY_MAX_LENGTH=50000
 OVERLONG_BUFFER_LENGTH=0
 ROLLOUT_N=10
-ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.4}"
+
+# 2 × A100 80GB throughput profile.
+# 0.65 is deliberately below the EDAS reference launcher's 0.8 because this
+# two-GPU setup also keeps FSDP parameters and optimizer state on GPU. In
+# practice GPU memory varies by rollout/update phase; the goal is a high
+# 60–70+ GB peak rather than forcing a constant allocation.
+ROLLOUT_GPU_MEM_UTIL="${ROLLOUT_GPU_MEM_UTIL:-0.65}"
 ROLLOUT_TP="${ROLLOUT_TP:-1}"
-ROLLOUT_MAX_NUM_BATCHED_TOKENS=32768
+ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-65536}"
+
 ACTOR_LR=1e-6
 ACTOR_WEIGHT_DECAY=1.0e-2
 ACTOR_ULYSSES=1
@@ -91,12 +109,23 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
 VAL_BATCH_SIZE=1024
 ACTOR_PPO_MINI_BATCH_SIZE="${ACTOR_PPO_MINI_BATCH_SIZE:-64}"
 ACTOR_PPO_MICRO_BSZ_PER_GPU="${ACTOR_PPO_MICRO_BSZ_PER_GPU:-1}"
+# With dynamic batching, this controls how many tokens can be packed into one
+# actor forward/backward microbatch. 64k makes better use of 80GB cards while
+# preserving exactly the same examples and loss.
+ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU="${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU:-65536}"
+# CPU offload is a memory-saving mode and costs PCIe/host transfer time. The
+# 4B model fits comfortably on 2 × 80GB with FSDP, so formal runs keep these
+# states on GPU by default. All values remain environment-overridable.
+ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-False}"
+ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD:-False}"
+REF_PARAM_OFFLOAD="${REF_PARAM_OFFLOAD:-False}"
+
 GEN_BATCH_SIZE="${GEN_BATCH_SIZE:-$((TRAIN_BATCH_SIZE * 2))}"
 NUM_GPUS="${NUM_GPUS:-2}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-}"
 
-# Official EDAS DAPO recipe values.  Do NOT use the module's generic 0.2/0.2
+# Official EDAS DAPO recipe values. Do NOT use the module's generic 0.2/0.2
 # defaults for the paper baseline.
 BRANCH_ADV_ALPHA=0.4
 BRANCH_ADV_BETA=0.3
@@ -112,7 +141,7 @@ REWARD_FN_PATH="${VR_ROOT}/examples/branch_adv/reward_function/math_no_format.py
 REWARD_FN_NAME="compute_score_batch"
 REWARD_MANAGER="batch"
 # Local adaptation: the official EDAS launcher can call a private LLM-judge
-# cluster.  This server does not have that service, so both methods use exactly
+# cluster. This server does not have that service, so both methods use exactly
 # the same rule + SymPy path with the judge disabled.
 ENABLE_LLM_JUDGE=False
 
@@ -122,8 +151,9 @@ VAL_TOP_K=20
 VAL_PRESENCE_PENALTY=1.5
 VAL_N=1
 
-# A real smoke test must limit optimiser steps.  Merely keeping two epochs does
-# not make the existing launcher short.
+# A real smoke test must limit optimiser steps. Keeping the same hardware
+# profile in smoke mode is intentional: it validates the memory settings that
+# will be used by the formal run.
 if [[ "${SMOKE}" == "1" ]]; then
   TOTAL_TRAINING_STEPS="${SMOKE_STEPS:-2}"
   TEST_FREQ=999999
@@ -203,10 +233,11 @@ PY_ARGS=(
   actor_rollout_ref.actor.grad_clip=${ACTOR_GRAD_NORM}
   actor_rollout_ref.actor.ppo_mini_batch_size=${ACTOR_PPO_MINI_BATCH_SIZE}
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ACTOR_PPO_MICRO_BSZ_PER_GPU}
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU}
   actor_rollout_ref.actor.use_dynamic_bsz=True
   actor_rollout_ref.actor.ulysses_sequence_parallel_size=${ACTOR_ULYSSES}
-  actor_rollout_ref.actor.fsdp_config.param_offload=True
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+  actor_rollout_ref.actor.fsdp_config.param_offload=${ACTOR_PARAM_OFFLOAD}
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload=${ACTOR_OPTIMIZER_OFFLOAD}
 
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.n=${ROLLOUT_N}
@@ -227,7 +258,7 @@ PY_ARGS=(
   actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}
   actor_rollout_ref.rollout.val_kwargs.do_sample=True
 
-  actor_rollout_ref.ref.fsdp_config.param_offload=True
+  actor_rollout_ref.ref.fsdp_config.param_offload=${REF_PARAM_OFFLOAD}
 
   reward.custom_reward_function.path=${REWARD_FN_PATH}
   reward.custom_reward_function.name=${REWARD_FN_NAME}
@@ -266,6 +297,10 @@ echo " rollout_n     : ${ROLLOUT_N}"
 echo " GPUs          : ${NUM_GPUS}"
 echo " epochs        : ${TOTAL_EPOCHS}"
 echo " total_steps   : ${TOTAL_TRAINING_STEPS:-derived-from-epochs}"
+echo " rollout mem   : ${ROLLOUT_GPU_MEM_UTIL}"
+echo " rollout tokens: ${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
+echo " actor tokens  : ${ACTOR_PPO_MAX_TOKEN_LEN_PER_GPU}"
+echo " actor offload : param=${ACTOR_PARAM_OFFLOAD}, optimizer=${ACTOR_OPTIMIZER_OFFLOAD}"
 echo " save_dir      : ${SAVE_DIR}"
 echo "=========================================="
 
