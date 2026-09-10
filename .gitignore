@@ -1,0 +1,36 @@
+# 模型权重、checkpoint
+*.bin
+*.safetensors
+*.pt
+*.pth
+checkpoints/
+ckpt/
+weights/
+
+# 数据集
+*.parquet
+*.jsonl
+data/
+dataset/
+
+# 日志、输出
+*.log
+*.out
+*.err
+outputs/
+runs/
+wandb/
+
+# 环境、虚拟环境
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# 临时文件
+*.swp
+*.swo
+.DS_Store
