@@ -1,208 +1,147 @@
 #!/usr/bin/env python3
-"""Unit tests for _apply_vote_risk_advantage_adjustment.
+"""Unit tests for the reviewed VoteRisk implementation."""
 
-Tests cover:
-  - p_c >> p_j → risk very low
-  - p_c ≈ p_j  → risk moderate
-  - p_j > p_c  → risk very high
-  - correct trajectories not modified
-  - all-correct / all-wrong groups skipped
-  - kappa-clip preserves sign
-  - numerical stability (no NaN)
-"""
+import math
 import os
 import sys
-import math
 
 import numpy as np
 import torch
 
-# Allow imports from the verl package directly.
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(THIS_DIR, "..", "..", ".."))
 sys.path.insert(0, REPO_ROOT)
 
-from verl.trainer.ppo.core_algos import (
-    _vote_risk_single_mode,
-    _apply_vote_risk_advantage_adjustment,
+from experiments.voterisk.vote_risk_impl import (
+    apply_vote_risk_advantage_adjustment,
+    vote_risk_single_mode,
 )
 
 
-# --- 1. Per-mode risk monotonicity ---
 def test_risk_monotonicity():
-    G = 10
-    K = 16
-    alpha = 0.5
-    # (n_c, n_j) tuples: n_c + n_j <= G
-    cases = [
-        (9, 1, "p_c >> p_j"),
-        (5, 5, "p_c ≈ p_j"),
-        (1, 9, "p_j > p_c"),
-    ]
-    print("=== test_risk_monotonicity ===")
-    risks = []
-    for n_c, n_j, desc in cases:
-        r = _vote_risk_single_mode(n_c, n_j, G, K, alpha)
-        print(f"  n_c={n_c} n_j={n_j} ({desc}): R={r:.6f}")
-        assert math.isfinite(r), f"Risk not finite: {r}"
-        assert 0.0 <= r <= 1.0, f"Risk out of bounds: {r}"
-        risks.append(r)
-    # Risk should increase as n_j overtakes n_c.
-    assert risks[0] < risks[1] < risks[2], (
-        f"Risk not monotonic in n_j when n_c fixed: {risks}"
-    )
-    print("  PASS: R_16 monotonically increases as n_j grows")
+    r_low = vote_risk_single_mode(9, 1, 10, 16, 0.5)
+    r_tie = vote_risk_single_mode(5, 5, 10, 16, 0.5)
+    r_high = vote_risk_single_mode(1, 9, 10, 16, 0.5)
+    print("risk monotonicity:", r_low, r_tie, r_high)
+    assert 0 <= r_low < r_tie < r_high <= 1
 
 
-# --- 2. Edge cases (n_j=0) ---
-def test_zero_wrong_mode_risk():
-    G = 10
-    K = 16
-    r = _vote_risk_single_mode(n_correct=10, n_j=0, G=G, K_target=K, alpha_smooth=0.5)
-    print(f"\n=== test_zero_wrong_mode_risk: R when n_j=0 = {r:.6f} ===")
-    assert math.isfinite(r)
-    # p_j is tiny (alpha/(G+3alpha)=0.5/11.5), so risk should be tiny.
-    assert r < 0.05, f"Risk when n_j=0 should be tiny: {r}"
-    print("  PASS: tiny risk when n_j=0")
-
-
-# --- 3. End-to-end shaping: correct trajectories not touched ---
-def test_correct_untouched():
-    """A group with both correct and wrong; correct trajectories' advantages
-    must be unchanged after applying VoteRisk."""
-    n_correct = 4
-    n_wrong = 6  # split across 3 modes: 3, 2, 1
-    answers_norm = (["c"] * n_correct) + (["w1"] * 3) + (["w2"] * 2) + (["w3"] * 1)
-    acc_list = [1.0] * n_correct + [0.0] * n_wrong
-    assert len(acc_list) == len(answers_norm)
-    index = ["uid0"] * (n_correct + n_wrong)
-
-    # Initial advantages (after GRPO standardization): all wrong are negative.
-    scores = torch.tensor(
-        [0.6, 0.4, 0.5, 0.3, -0.5, -0.7, -0.9, -0.4, -0.6, -0.3],
-        dtype=torch.float32,
-    )
-    correct_orig = scores[:n_correct].clone()
-    scores_orig = scores.clone()
-
-    out_metrics: dict = {}
-    _apply_vote_risk_advantage_adjustment(
-        scores=scores,
-        index=np.array(index),
-        acc_list=acc_list,
-        answer_list=answers_norm,
-        format_list=None,
-        G=10,
-        K_target=16,
-        alpha_smooth=0.5,
-        lambda_vote=0.4,
-        log_path=None,
-        step=0,
-        out_metrics=out_metrics,
-    )
-
-    # Correct trajectories must not change.
-    assert torch.allclose(scores[:n_correct], correct_orig), (
-        f"Correct trajectories were modified! before={correct_orig.tolist()} "
-        f"after={scores[:n_correct].tolist()}"
-    )
-    # Wrong trajectories: kappa-clip must preserve sign(A_final) == sign(A_orig).
-    for i in range(n_correct, len(scores)):
-        new_adv = scores[i].item()
-        orig_adv = scores_orig[i].item()
-        # If both are non-zero, sign must match. Zero is a degenerate edge case
-        # allowed (rare; happens when orig_adv = 0).
-        if abs(orig_adv) > 1e-9 and abs(new_adv) > 1e-9:
-            assert math.copysign(1.0, new_adv) == math.copysign(1.0, orig_adv), (
-                f"Sign flipped at i={i}: orig={orig_adv} new={new_adv}"
-            )
-        # kappa-clip: |delta| <= |orig|/kappa.
-        delta = new_adv - orig_adv
-        assert abs(delta) <= abs(orig_adv) / 2.0 + 1e-9, (
-            f"delta exceeds kappa-clip at i={i}: |delta|={abs(delta)} "
-            f"limit={abs(orig_adv) / 2.0}"
-        )
-
-    # Metrics reported.
-    assert "groups_processed" in out_metrics
-    assert out_metrics["groups_processed"] >= 1
-    print(f"\n=== test_correct_untouched: out_metrics={out_metrics} ===")
-    print("  PASS: correct trajectories untouched, sign preserved")
-
-
-# --- 4. Skipped groups ---
-def test_skipped_groups():
-    """all-correct and all-wrong groups should be skipped (no shaping)."""
-    # Group A: all correct
-    idx_a = ["a"] * 5
-    acc_a = [1.0] * 5
-    ans_a = ["42"] * 5
-    # Group B: all wrong with single mode (K=1 → skipped per algorithm)
-    idx_b = ["b"] * 5
-    acc_b = [0.0] * 5
-    ans_b = ["x"] * 5
-    # Group C: all wrong, no correct answer (n_c=0 → skipped)
-    idx_c = ["c"] * 5
-    acc_c = [0.0] * 5
-    ans_c = ["x1", "x2", "x3", "x4", "x5"]
-
-    scores = torch.tensor(
-        [-0.2, -0.4, 0.1, 0.2, 0.3, -0.1, -0.5, -0.7, -0.9, -0.3, -0.4, -0.5, -0.6, -0.7, -0.8],
-        dtype=torch.float32,
-    )
-    scores_orig = scores.clone()
-    index = np.array(idx_a + idx_b + idx_c)
-    acc = acc_a + acc_b + acc_c
-    ans = ans_a + ans_b + ans_c
-
-    out_metrics: dict = {}
-    _apply_vote_risk_advantage_adjustment(
+def _run_group(n_correct: int, wrong_counts: list[int]):
+    G = n_correct + sum(wrong_counts)
+    acc = [1.0] * n_correct
+    answers = ["correct"] * n_correct
+    for mode, count in enumerate(wrong_counts):
+        acc.extend([0.0] * count)
+        answers.extend([f"wrong_{mode}"] * count)
+    index = np.array(["uid"] * G)
+    # Equal-magnitude negative advantages make the shaping direction transparent.
+    scores = torch.tensor([1.0] * n_correct + [-1.0] * sum(wrong_counts), dtype=torch.float32)
+    before = scores.clone()
+    metrics = {}
+    apply_vote_risk_advantage_adjustment(
         scores=scores,
         index=index,
         acc_list=acc,
-        answer_list=ans,
+        answer_list=answers,
         format_list=None,
-        G=10,
+        G=10,  # intentionally config value; implementation must use actual G
         K_target=16,
         alpha_smooth=0.5,
         lambda_vote=0.4,
         log_path=None,
         step=0,
-        out_metrics=out_metrics,
+        out_metrics=metrics,
+        kappa=2.0,
     )
-    # All three groups should be skipped → no delta.
-    assert torch.allclose(scores, scores_orig), "Skipped groups were modified"
-    assert out_metrics["groups_processed"] == 0, (
-        f"Expected 0 processed, got {out_metrics['groups_processed']}"
-    )
-    print(f"\n=== test_skipped_groups: processed={out_metrics['groups_processed']} ===")
-    print("  PASS: skipped groups not modified")
+    return before, scores, metrics
 
 
-# --- 5. No NaN ---
-def test_no_nan():
-    """Random rollout with 50% correct; check no NaN / inf introduced."""
-    torch.manual_seed(42)
-    np.random.seed(42)
+def test_high_risk_is_penalised_more():
+    # nc=3; wrong modes 4,2,1. The 4-count mode is the strongest vote threat.
+    before, after, metrics = _run_group(3, [4, 2, 1])
+    wrong_after = after[3:].tolist()
+    mode0 = wrong_after[:4]
+    mode1 = wrong_after[4:6]
+    mode2 = wrong_after[6:]
+    print("high-risk direction:", mode0[0], mode1[0], mode2[0], metrics)
+    assert mode0[0] < -1.0, "highest-risk wrong mode must become MORE negative"
+    assert mode2[0] > -1.0, "lowest-risk wrong mode should be relaxed"
+    assert mode0[0] < mode1[0] < mode2[0]
+    assert torch.allclose(after[:3], before[:3]), "correct trajectories must remain unchanged"
+
+
+def test_absolute_risk_magnitude_is_preserved():
+    # Same idea as the motivation: a dominant wrong mode far below the correct
+    # mode should receive a smaller correction than a genuinely competitive
+    # wrong mode. Max-normalising risk deviations would largely erase this.
+    _, harmless, m_harmless = _run_group(6, [3, 1])
+    _, dangerous, m_dangerous = _run_group(3, [4, 3])
+
+    harmless_delta = abs(float(harmless[6].item()) + 1.0)  # first 3-count wrong
+    dangerous_delta = abs(float(dangerous[3].item()) + 1.0)  # first 4-count wrong
+    print("absolute magnitude:", harmless_delta, dangerous_delta)
+    print("metrics harmless/dangerous:", m_harmless, m_dangerous)
+    assert dangerous_delta > harmless_delta, (
+        "a genuinely competitive wrong mode should get a larger correction "
+        "than a harmless dominant-in-wrongs mode"
+    )
+
+
+def test_zero_sum_before_clip_behavior():
+    # With equal |A| and small lambda no sample should hit kappa clip, so the
+    # sample-weighted centred desired deltas should sum to ~0.
+    before, after, metrics = _run_group(3, [4, 2, 1])
+    wrong_delta_sum = float((after[3:] - before[3:]).sum().item())
+    print("wrong delta sum:", wrong_delta_sum, metrics)
+    assert abs(wrong_delta_sum) < 1e-6
+    assert abs(metrics["mean_delta"]) < 1e-6
+
+
+def test_skips_unidentifiable_groups():
+    # No correct rollout => correct-vs-wrong competition cannot be estimated.
     G = 10
-    n_groups = 16
+    scores = torch.full((G,), -1.0)
+    before = scores.clone()
+    metrics = {}
+    apply_vote_risk_advantage_adjustment(
+        scores=scores,
+        index=np.array(["x"] * G),
+        acc_list=[0.0] * G,
+        answer_list=[f"w{i%3}" for i in range(G)],
+        format_list=None,
+        G=G,
+        K_target=16,
+        alpha_smooth=0.5,
+        lambda_vote=0.4,
+        log_path=None,
+        step=0,
+        out_metrics=metrics,
+    )
+    assert torch.allclose(scores, before)
+    assert metrics["groups_processed"] == 0
+
+
+def test_no_nan_random_batch():
+    rng = np.random.RandomState(42)
+    G = 10
+    groups = 32
+    scores = []
     acc = []
     ans = []
-    index = []
-    scores_list = []
-    for g in range(n_groups):
-        idx = f"uid_{g}"
-        for _ in range(G):
-            index.append(idx)
-            is_correct = np.random.rand() < 0.6
-            acc.append(1.0 if is_correct else 0.0)
-            ans.append("c" if is_correct else f"w{np.random.randint(0, 4)}")
-            scores_list.append(np.random.randn())
-    scores = torch.tensor(scores_list, dtype=torch.float32)
-    out_metrics: dict = {}
-    _apply_vote_risk_advantage_adjustment(
-        scores=scores,
-        index=np.array(index),
+    ids = []
+    for g in range(groups):
+        # Force at least one correct and at least two wrong modes often enough.
+        for i in range(G):
+            c = i < 4 if g % 2 == 0 else rng.rand() < 0.5
+            ids.append(f"g{g}")
+            acc.append(1.0 if c else 0.0)
+            ans.append("c" if c else f"w{rng.randint(0, 4)}")
+            scores.append(0.7 if c else -0.7)
+    t = torch.tensor(scores, dtype=torch.float32)
+    metrics = {}
+    apply_vote_risk_advantage_adjustment(
+        scores=t,
+        index=np.array(ids),
         acc_list=acc,
         answer_list=ans,
         format_list=None,
@@ -212,19 +151,19 @@ def test_no_nan():
         lambda_vote=0.4,
         log_path=None,
         step=0,
-        out_metrics=out_metrics,
+        out_metrics=metrics,
     )
-    assert torch.isfinite(scores).all(), "NaN / inf in scores"
-    print(f"\n=== test_no_nan: processed={out_metrics['groups_processed']} skip={out_metrics['groups_skip']} ===")
-    print(f"  mean_risk={out_metrics.get('mean_risk', 0):.4f} max_risk={out_metrics.get('max_risk', 0):.4f}")
-    print(f"  mean_delta_abs={out_metrics.get('mean_delta_abs', 0):.4f}")
-    print("  PASS: no NaN / inf, finite deltas")
+    assert torch.isfinite(t).all()
+    assert 0.0 <= metrics["mean_risk"] <= 1.0
+    assert 0.0 <= metrics["max_risk"] <= 1.0
+    print("random metrics:", metrics)
 
 
 if __name__ == "__main__":
     test_risk_monotonicity()
-    test_zero_wrong_mode_risk()
-    test_correct_untouched()
-    test_skipped_groups()
-    test_no_nan()
-    print("\nALL VoteRisk unit tests PASSED.")
+    test_high_risk_is_penalised_more()
+    test_absolute_risk_magnitude_is_preserved()
+    test_zero_sum_before_clip_behavior()
+    test_skips_unidentifiable_groups()
+    test_no_nan_random_batch()
+    print("\nALL REVIEWED VoteRisk unit tests PASSED.")
