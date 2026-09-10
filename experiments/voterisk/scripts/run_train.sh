@@ -48,10 +48,13 @@ cd "${VR_ROOT}"
 # A100-SXM4 is compute capability 8.0. Restricting extension compilation to
 # sm80 avoids compiling kernels for irrelevant architectures on this server.
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0}"
-# High-memory colocated RL workloads can fragment the CUDA allocator. This
-# setting makes large, changing token batches less likely to fail from
-# fragmentation while still allowing the allocator to reuse segments.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# verl's colocated vLLM rollout uses vLLM's CuMem memory pool. Current vLLM
+# explicitly rejects PyTorch expandable_segments with that pool, so remove the
+# option if it was inherited from the shell. Do not enable it for this launcher.
+if [[ "${PYTORCH_CUDA_ALLOC_CONF:-}" == *"expandable_segments:True"* ]]; then
+  unset PYTORCH_CUDA_ALLOC_CONF
+fi
 
 # These defaults match the user's server layout shown for workspace_135.
 TRAIN_FILE="${TRAIN_FILE:-/home/luorongchuan/workspace_135/datasets/dapo-math-17k.formatted.train.parquet}"
