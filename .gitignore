@@ -3,32 +3,33 @@
 *.safetensors
 *.pt
 *.pth
-checkpoints/
-ckpt/
-weights/
+/checkpoints/
+/ckpt/
+/weights/
 
-# 数据集
+# 数据集（仅忽略仓库根目录的数据目录；不要忽略源码中的 verl/utils/dataset）
 *.parquet
 *.jsonl
-data/
-dataset/
+/data/
+/dataset/
+/datasets/
 
 # 日志、输出
 *.log
 *.out
 *.err
-outputs/
-runs/
-wandb/
+/outputs/
+/runs/
+/wandb/
 
 # 环境、虚拟环境
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.venv/
-venv/
-env/
+/.venv/
+/venv/
+/env/
 
 # 临时文件
 *.swp
