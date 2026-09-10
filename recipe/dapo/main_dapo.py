@@ -43,6 +43,19 @@ class DAPOTaskRunner(TaskRunner):
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
+        # VoteRisk is an experiment-layer extension.  Install the reviewed
+        # implementation *inside this Ray worker process* before the DAPO
+        # trainer starts.  Patching only in the launcher process would not
+        # propagate through Ray.  EDAS is untouched when vote_risk is off.
+        if config.algorithm.get("vote_risk_enabled", False):
+            from experiments.voterisk.vote_risk_impl import (
+                _apply_vote_risk_advantage_adjustment as reviewed_vote_risk,
+            )
+            from verl.trainer.ppo import core_algos
+
+            core_algos._apply_vote_risk_advantage_adjustment = reviewed_vote_risk
+            print("[VoteRisk] installed reviewed vote-risk shaping implementation")
+
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
         self.add_reward_model_resource_pool(config)
