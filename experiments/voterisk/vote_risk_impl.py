@@ -4,32 +4,23 @@ This module intentionally lives outside the vendored verl core so the EDAS
 baseline remains untouched. ``recipe.dapo.main_dapo`` installs this function
 at runtime when ``algorithm.vote_risk_enabled=True``.
 
-Design
-------
-For a prompt group, let n_c be the number of verified-correct rollouts and
-n_j the count of a canonical wrong-answer mode j.  For a target test-time
-budget K, we compute exactly
+For each valid wrong-answer mode j we compute the finite-budget vote threat
 
-    R_{K,j} = P(N_j >= N_c)
+    R_{K,j} = P(N_j >= N_c),
 
-under a three-category multinomial model (correct, wrong mode j, all other
-answers) with symmetric Dirichlet smoothing.
+where correct, wrong-mode-j and all-other outcomes form a smoothed trinomial.
+Unparseable/no-answer generations are part of "other" probability mass, but
+are not themselves voting modes.  This matches evaluation, where they abstain.
 
-The shaping signal is the *absolute* vote-risk deviation from the
-sample-weighted mean wrong risk,
+The shaping signal preserves absolute risk magnitude:
 
-    d_j = R_{K,j} - sum_l n_l R_{K,l} / N_w.
+    R_bar = sum_j n_j R_j / N_w
+    Delta_i = -lambda * mean(|A_wrong|) * (R_i - R_bar).
 
-We deliberately do NOT divide by max|d_j|.  Such a normalisation would erase
-the absolute threat magnitude and make a harmless dominant wrong mode look as
-important as a genuinely competitive wrong mode.  Desired deltas are
-
-    Delta_i = -lambda * mean(|A_wrong|) * d_j,
-
-so high-risk wrong modes become more negative while low-risk modes become less
-negative.  Because the mean is weighted by per-mode sample counts, desired
-wrong-sample deltas sum to zero before clipping.  EDAS's kappa clipping is then
-applied to preserve the sign of each original advantage.
+We deliberately do not divide by max|R-R_bar|.  Such normalisation would erase
+the distinction between a harmless dominant-in-wrongs mode and a genuinely
+competitive wrong mode.  Sample-weighted centring makes desired wrong-sample
+deltas sum to zero before EDAS-style kappa clipping.
 """
 
 from __future__ import annotations
@@ -71,9 +62,7 @@ def vote_risk_single_mode(
     if G <= 0:
         raise ValueError(f"G must be positive, got {G}")
     if not (0 <= n_correct <= G and 0 <= n_j <= G and n_correct + n_j <= G):
-        raise ValueError(
-            f"invalid counts: n_correct={n_correct}, n_j={n_j}, G={G}"
-        )
+        raise ValueError(f"invalid counts: n_correct={n_correct}, n_j={n_j}, G={G}")
     if alpha_smooth < 0:
         raise ValueError(f"alpha_smooth must be >= 0, got {alpha_smooth}")
 
@@ -87,7 +76,6 @@ def vote_risk_single_mode(
     tab = _get_multinomial_table(K_target)
     risk = 0.0
     for a in range(K_target + 1):
-        # a = correct votes, b = votes for wrong mode j.  Tie is a threat.
         for b in range(a, K_target - a + 1):
             coeff = tab[a, b]
             if coeff == 0.0:
@@ -97,13 +85,14 @@ def vote_risk_single_mode(
 
 
 def _canonicalise_wrong_answers(answers: list[str]) -> tuple[dict[int, str], Counter]:
-    """Cluster answers using the same math-equivalence check as EDAS."""
+    """Cluster non-empty wrong answers using EDAS's math-equivalence checker."""
     representatives: list[str] = []
     sample_to_rep: dict[int, str] = {}
     counts: Counter = Counter()
-
     for pos, raw in enumerate(answers):
         ans = str(raw).strip().lower()
+        if not ans:
+            raise ValueError("empty answer must be filtered before canonicalisation")
         rep = None
         for candidate in representatives:
             try:
@@ -135,13 +124,7 @@ def apply_vote_risk_advantage_adjustment(
     out_metrics: dict,
     kappa: float = 2.0,
 ) -> None:
-    """Apply corrected VoteRisk shaping in-place.
-
-    ``G`` is retained in the signature for compatibility with the existing
-    trainer configuration, but each prompt uses its actual group size.  This
-    avoids silently using the wrong probability model if dynamic batching ever
-    produces a group whose size differs from ``rollout.n``.
-    """
+    """Apply reviewed VoteRisk shaping in-place after GRPO/DAPO normalisation."""
     if kappa <= 1.0:
         raise ValueError(f"kappa must be > 1, got {kappa}")
     if lambda_vote < 0:
@@ -154,6 +137,7 @@ def apply_vote_risk_advantage_adjustment(
     n_groups_processed = 0
     n_groups_skip = 0
     n_group_size_mismatch = 0
+    n_no_answer_skipped = 0
     n_adjusted = 0
     n_risk_samples = 0
     sum_wrong = 0
@@ -171,18 +155,23 @@ def apply_vote_risk_advantage_adjustment(
         if G_group != G:
             n_group_size_mismatch += 1
 
-        wrong_indices = [
-            i
-            for i in indices
-            if float(acc_list[i]) == 0.0
-            and (format_list is None or float(format_list[i]) >= 0.5)
-        ]
+        # Only a valid extracted mathematical answer can compete as a vote
+        # mode. Empty/unparseable generations are abstentions and remain in
+        # the trinomial "other" mass via G_group - n_c - n_j.
+        wrong_indices = []
+        for i in indices:
+            if float(acc_list[i]) != 0.0:
+                continue
+            if format_list is not None and float(format_list[i]) < 0.5:
+                continue
+            if not str(answer_list[i]).strip():
+                n_no_answer_skipped += 1
+                continue
+            wrong_indices.append(i)
+
         N_w = len(wrong_indices)
         n_c = sum(1 for i in indices if float(acc_list[i]) >= 1.0 - 1e-9)
 
-        # No verified correct mode -> vote competition against the correct mode
-        # cannot be estimated from this group.  All-correct and <=1 wrong are
-        # also uninformative for within-wrong redistribution.
         if n_c == 0 or n_c == G_group or N_w <= 1:
             n_groups_skip += 1
             continue
@@ -203,12 +192,9 @@ def apply_vote_risk_advantage_adjustment(
                 alpha_smooth=alpha_smooth,
             )
 
-        # IMPORTANT: sample-weighted centring gives sum_i d_i = 0 over wrong
-        # samples.  A mode-level unweighted mean would not preserve that budget.
         mean_risk = sum(
             canonical_counts[rep] * risk for rep, risk in per_mode_risk.items()
         ) / N_w
-
         deviations = {rep: risk - mean_risk for rep, risk in per_mode_risk.items()}
         if max(abs(v) for v in deviations.values()) < eps:
             n_groups_skip += 1
@@ -226,7 +212,7 @@ def apply_vote_risk_advantage_adjustment(
         if log_path:
             log_lines.append(
                 f"\n[group {uid}] G_actual={G_group} G_cfg={G} n_c={n_c} "
-                f"N_w={N_w} modes={len(canonical_counts)} base={base:.6f} "
+                f"N_valid_wrong={N_w} modes={len(canonical_counts)} base={base:.6f} "
                 f"weighted_mean_risk={mean_risk:.6f}"
             )
             log_lines.append(f"  counts={dict(canonical_counts)}")
@@ -234,21 +220,20 @@ def apply_vote_risk_advantage_adjustment(
                 "  risks=" + str({k: round(v, 6) for k, v in per_mode_risk.items()})
             )
 
-        # Desired delta is NEGATIVE for above-average risk, making a negative
-        # wrong advantage more negative.  Below-average risk is relaxed.
         for pos, i in enumerate(wrong_indices):
             rep = sample_to_rep[pos]
             risk_i = per_mode_risk[rep]
             dev_i = deviations[rep]
             orig_adv = orig_advs[pos]
+            # Critical sign: high vote risk -> more negative wrong advantage.
             delta_desired = -lambda_vote * base * dev_i
 
             max_delta = abs(orig_adv) / kappa
-            if abs(delta_desired) <= max_delta:
-                delta_final = delta_desired
-            else:
-                delta_final = math.copysign(max_delta, delta_desired)
-
+            delta_final = (
+                delta_desired
+                if abs(delta_desired) <= max_delta
+                else math.copysign(max_delta, delta_desired)
+            )
             new_adv = orig_adv + delta_final
             scores[i] = scores[i].new_tensor(new_adv)
 
@@ -272,7 +257,7 @@ def apply_vote_risk_advantage_adjustment(
             "=" * 72,
             f"=== step {step} (VoteRisk reviewed) ===",
             f"groups_processed={n_groups_processed} skip={n_groups_skip} "
-            f"G_mismatch={n_group_size_mismatch}",
+            f"G_mismatch={n_group_size_mismatch} no_answer_skipped={n_no_answer_skipped}",
             f"K_target={K_target} alpha={alpha_smooth} lambda={lambda_vote} kappa={kappa}",
             "=" * 72,
         ]
@@ -283,6 +268,7 @@ def apply_vote_risk_advantage_adjustment(
     out_metrics["groups_skip"] = n_groups_skip
     out_metrics["groups_total"] = n_groups_processed + n_groups_skip
     out_metrics["group_size_mismatch"] = n_group_size_mismatch
+    out_metrics["no_answer_skipped"] = n_no_answer_skipped
     out_metrics["mean_wrong_per_group"] = (
         sum_wrong / n_groups_processed if n_groups_processed else 0.0
     )
@@ -293,12 +279,9 @@ def apply_vote_risk_advantage_adjustment(
         sum_group_max_risk / n_groups_processed if n_groups_processed else 0.0
     )
     out_metrics["max_risk"] = max_risk_global
-    out_metrics["mean_delta_abs"] = (
-        sum_delta_abs / n_adjusted if n_adjusted else 0.0
-    )
+    out_metrics["mean_delta_abs"] = sum_delta_abs / n_adjusted if n_adjusted else 0.0
     out_metrics["max_delta_abs"] = max_delta_abs
     out_metrics["mean_delta"] = sum_delta / n_adjusted if n_adjusted else 0.0
 
 
-# Alias matching the legacy core name, useful for a one-line monkeypatch.
 _apply_vote_risk_advantage_adjustment = apply_vote_risk_advantage_adjustment
